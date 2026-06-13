@@ -1,0 +1,1242 @@
+/*
+ * RxTricoMaster — Receituário Médico Digital v2.0
+ * - Medicamentos: apenas nome, dosagem, unidade
+ * - Posologias padrão gerenciadas em Configurações
+ * - Fórmulas: posologia e observação são da fórmula (não por medicamento)
+ * - Receitas: mesma lógica
+ * - Impressão simplificada
+ */
+
+// ─── ESTADO ───────────────────────────────────────────────────────────────────
+
+let appData = {
+    config: { nome:'Clínica Médica', logoUrl:'', tel:'', wpp:'', end1:'', end2:'', cnpj:'' },
+    medicamentos: [],
+    posologias: [],
+    formulas: [],
+    receitas: [],
+    controladas: [],
+    medicos: [],
+};
+
+let ui = {
+    userId: null, userDocRef: null,
+    perfil: 'admin',
+    viewAtiva: 'receitas',
+    recPage: 1, recSearch: '',
+    formPage: 1, formSearch: '',
+    medPage: 1, medSearch: '',
+    ctrlPage: 1, ctrlSearch: '',
+    PER_PAGE: 10,
+};
+
+let receitaEmEdicao = null;
+let formulaEmEdicao = null;
+let modalContexto   = 'receita';
+
+const app = {};
+
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
+
+app.uid    = () => { try { return db.collection('_').doc().id; } catch(e) { return 'l'+Date.now()+Math.random().toString(36).slice(2,8); } };
+app.el     = id => document.getElementById(id);
+app.val    = id => { const e=app.el(id); return e?e.value:''; };
+app.setVal = (id,v) => { const e=app.el(id); if(e) e.value = v??''; };
+app.show   = (id, flex=false) => { const e=app.el(id); if(e) e.style.display=flex?'flex':'block'; };
+app.hide   = id => { const e=app.el(id); if(e) e.style.display='none'; };
+
+app.toast = (msg, type='ok') => {
+    const t=app.el('toast'); t.textContent=msg; t.className=`toast ${type}`; t.classList.add('show');
+    clearTimeout(app._toastTimer); app._toastTimer=setTimeout(()=>t.classList.remove('show'),3000);
+};
+
+app.paginate = (lista, page, perPage) => {
+    const total=lista.length, pages=Math.max(1,Math.ceil(total/perPage));
+    const p=Math.min(Math.max(1,page),pages);
+    return { items:lista.slice((p-1)*perPage,p*perPage), page:p, pages, total };
+};
+
+app.renderPag = (containerId, page, pages, total, onPrev, onNext) => {
+    const c=app.el(containerId); if(!c) return;
+    if(pages<=1){ c.style.display='none'; return; }
+    c.style.display='flex';
+    c.innerHTML=`<span>${total} item${total!==1?'s':''}</span><div class="pag-btns"><button class="pag-btn" onclick="${onPrev}" ${page<=1?'disabled':''}>&#8249; Anterior</button><span style="padding:4px 10px;font-size:13px;color:#555;">Pág ${page}/${pages}</span><button class="pag-btn" onclick="${onNext}" ${page>=pages?'disabled':''}>Próximo &#8250;</button></div>`;
+};
+
+app.fmtDosagem = (qtd, unidade) => {
+    if(!qtd && !unidade) return '';
+    return unidade ? `${qtd} ${unidade}` : qtd;
+};
+
+// Title-case helper para campos de texto
+app.toTitleCase = str => str ? str.replace(/\b\w/g, c => c.toUpperCase()) : str;
+
+// Toggle campo livre Forma de Uso (receita)
+app.onFormaUsoChange = () => {
+    const v = app.val('rec-forma-uso');
+    const wrap = app.el('rec-forma-uso-livre-wrap');
+    if(wrap) wrap.style.display = v === 'livre' ? 'block' : 'none';
+};
+
+// Toggle campo livre Apresentação (fórmula)
+app.onFormApresentacaoChange = () => {
+    const v = app.val('form-apresentacao');
+    const wrap = app.el('form-apresentacao-livre-wrap');
+    if(wrap) wrap.style.display = v === 'livre' ? 'block' : 'none';
+};
+
+// Toggle campo livre Apresentação (receita)
+app.onRecApresentacaoChange = () => {
+    const v = app.val('rec-apresentacao');
+    const wrap = app.el('rec-apresentacao-livre-wrap');
+    if(wrap) wrap.style.display = v === 'livre' ? 'block' : 'none';
+};
+
+// Retorna texto de Forma de Uso da receita
+app._getFormaUsoTexto = () => {
+    const v = app.val('rec-forma-uso');
+    if(v === 'livre') return app.val('rec-forma-uso-livre').trim();
+    const labels = {oral:'Via Oral',topica:'Uso Tópico',injetavel:'Via Injetável',sublingual:'Via Sublingual',inalatoria:'Via Inalatória',oftalmico:'Uso Oftálmico',nasal:'Uso Nasal',retal:'Uso Retal',vaginal:'Uso Vaginal'};
+    return labels[v] || '';
+};
+
+// Retorna texto de Apresentação da fórmula
+app._getApresentacaoTexto = () => {
+    const v = app.val('form-apresentacao');
+    if(v === 'livre') return app.toTitleCase(app.val('form-apresentacao-livre').trim());
+    return v || '';
+};
+
+// Retorna texto de Apresentação da receita
+app._getRecApresentacaoTexto = () => {
+    const v = app.val('rec-apresentacao');
+    if(v === 'livre') return app.toTitleCase(app.val('rec-apresentacao-livre').trim());
+    return v || '';
+};
+
+// ─── FIREBASE ─────────────────────────────────────────────────────────────────
+
+app.init = () => {
+    app.el('login-form').addEventListener('submit', app.handleLogin);
+    auth.onAuthStateChanged(async user => {
+        if(user){
+            ui.userId=user.uid;
+            ui.userDocRef=db.collection('rxmaster_v1').doc(user.uid);
+            app.hide('login-view'); app.show('loading-view',true);
+            await app.loadPerfil(user.uid);
+            await app.loadData();
+            app.hide('loading-view'); app.show('app-view',true);
+            app.aplicarRestricaoPerfil();
+            app.navigate('receitas');
+        } else {
+            app.show('login-view',true); app.hide('loading-view'); app.hide('app-view');
+        }
+    });
+};
+
+// ─── PERFIL ───────────────────────────────────────────────────────────────────
+
+app.loadPerfil = async uid => {
+    try {
+        const doc = await db.collection('users').doc(uid).get();
+        if(doc.exists){
+            ui.perfil = doc.data().perfil || 'medico';
+        } else {
+            // Primeiro acesso: assume admin.
+            // Para outros usuários, defina o perfil manualmente no Console do Firebase:
+            // Coleção "users" → documento com o UID → campo "perfil": "medico"
+            ui.perfil = 'admin';
+        }
+    } catch(e){
+        console.warn('Erro ao carregar perfil, assumindo médico por segurança.');
+        ui.perfil = 'medico';
+    }
+};
+
+app.aplicarRestricaoPerfil = () => {
+    const isMedico = ui.perfil === 'medico';
+    // Menus restritos para médico: Configurações, Medicamentos, Fórmulas
+    const restritos = ['nav-config','nav-medicamentos','nav-formulas',
+                       'bn-config','bn-medicamentos','bn-formulas'];
+    restritos.forEach(id => {
+        const el = app.el(id);
+        if(el) el.style.display = isMedico ? 'none' : '';
+    });
+    // Bloquear navigate para seções restritas
+    if(isMedico){
+        const _nav = app.navigate.bind(app);
+        app.navigate = view => {
+            if(['config','medicamentos','formulas'].includes(view)){
+                app.toast('Acesso restrito.','err'); return;
+            }
+            _nav(view);
+        };
+    }
+};
+
+app.handleLogin = e => {
+    e.preventDefault();
+    const btn=app.el('btn-login'), err=app.el('login-error');
+    err.style.display='none'; btn.disabled=true; btn.textContent='Entrando...';
+    auth.signInWithEmailAndPassword(app.val('login-email'),app.val('login-password'))
+        .catch(()=>{ err.textContent='E-mail ou senha inválidos.'; err.style.display='block'; btn.disabled=false; btn.textContent='Entrar'; });
+};
+
+app.handleLogout = () => { if(confirm('Sair do sistema?')) auth.signOut(); };
+
+app.loadData = async () => {
+    try {
+        const doc=await ui.userDocRef.get();
+        if(doc.exists){
+            const d=doc.data();
+            appData={...appData,...d,config:{...appData.config,...(d.config||{})}};
+            if(!appData.posologias) appData.posologias=[];
+            if(!appData.controladas) appData.controladas=[];
+        } else {
+            await ui.userDocRef.set(appData);
+        }
+    } catch(e){ console.error(e); app.toast('Erro ao carregar dados.','err'); }
+};
+
+app.save = async col => {
+    if(!ui.userDocRef) return;
+    try { await ui.userDocRef.set({[col]:appData[col]},{merge:true}); }
+    catch(e){ console.error(e); app.toast('Erro ao salvar.','err'); }
+};
+
+// ─── NAVEGAÇÃO ────────────────────────────────────────────────────────────────
+
+app.navigate = view => {
+    ui.viewAtiva=view;
+    document.querySelectorAll('main > section').forEach(s=>s.style.display='none');
+    app.show(`view-${view}`);
+    document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
+    const ni=app.el(`nav-${view}`); if(ni) ni.classList.add('active');
+    document.querySelectorAll('#bottom-nav .bn-item').forEach(b=>b.classList.remove('active'));
+    const bn=app.el(`bn-${view}`); if(bn) bn.classList.add('active');
+    if(view==='receitas')     app.renderReceitaList();
+    if(view==='controlada')   app.renderControladaList();
+    if(view==='formulas')     app.renderFormulaList();
+    if(view==='medicamentos') app.renderMedicamentos();
+    if(view==='config')       app.populateConfig();
+};
+
+// ─── RECEITA CONTROLADA ───────────────────────────────────────────────────────
+
+let controladaEmEdicao = null;
+
+app.renderControladaList = () => {
+    app.show('ctrl-list-view'); app.hide('ctrl-editor-view');
+    const q=(app.val('ctrl-search')||'').toLowerCase();
+    const lista=(appData.controladas||[])
+        .filter(r=>(r.paciente||'').toLowerCase().includes(q)||(r.medico||'').toLowerCase().includes(q))
+        .sort((a,b)=>new Date(b.data)-new Date(a.data));
+    const {items,page,pages,total}=app.paginate(lista,ui.ctrlPage,ui.PER_PAGE);
+    ui.ctrlPage=page;
+    const empty=app.el('ctrl-empty'), table=app.el('ctrl-table');
+    if(!lista.length){ empty.style.display='block'; table.style.display='none'; app.hide('ctrl-pag'); return; }
+    empty.style.display='none'; table.style.display='table';
+    app.el('ctrl-tbody').innerHTML=items.map(r=>`
+        <tr>
+            <td data-label="#">${r.id}</td>
+            <td data-label="Data">${new Date(r.data+'T12:00:00').toLocaleDateString('pt-BR')}</td>
+            <td data-label="Paciente" style="font-weight:500;">${r.paciente}</td>
+            <td data-label="Médico" style="font-size:13px;color:#013425;font-weight:500;">${r.medico||'—'}</td>
+            <td data-label="CRM" style="font-size:12px;color:#888;">${r.crm||'—'}</td>
+            <td data-label="Ações" style="text-align:center;">
+                <div style="display:flex;justify-content:center;gap:3px;">
+                    <button onclick="app.imprimirControlada('${r.id}')" class="btn-icon" title="Imprimir"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6,9 6,2 18,2 18,9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg></button>
+                    <button onclick="app.editControlada('${r.id}')" class="btn-icon" title="Editar"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>
+                    <button onclick="app.deleteControlada('${r.id}')" class="btn-icon btn-danger" title="Excluir"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3,6 5,6 21,6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg></button>
+                </div>
+            </td>
+        </tr>`).join('');
+    app.renderPag('ctrl-pag',page,pages,total,"app.ctrlPagePrev()","app.ctrlPageNext()");
+};
+app.ctrlPagePrev=()=>{ ui.ctrlPage--; app.renderControladaList(); };
+app.ctrlPageNext=()=>{ ui.ctrlPage++; app.renderControladaList(); };
+
+app.novaControlada = () => {
+    controladaEmEdicao={id:null,paciente:'',medicoId:'',medico:'',crm:'',data:new Date().toISOString().slice(0,10),
+        endEmitente:'',endPaciente:'',prescricao:'',
+        compradorNome:'',compradorIdent:'',compradorOrg:'',compradorEnd:'',compradorCidade:'',compradorUF:'',compradorTel:''};
+    app.abrirEditorControlada('Nova Receita Controlada');
+};
+
+app.editControlada = id => {
+    const r=(appData.controladas||[]).find(x=>x.id===id); if(!r) return;
+    controladaEmEdicao=JSON.parse(JSON.stringify(r));
+    app.abrirEditorControlada(`Editando #${id}`);
+};
+
+app.deleteControlada = async id => {
+    if(!confirm('Excluir receita controlada?')) return;
+    appData.controladas=(appData.controladas||[]).filter(r=>r.id!==id);
+    app.renderControladaList(); await app.save('controladas'); app.toast('Excluída.');
+};
+
+app.voltarControladaList = () => app.renderControladaList();
+
+app.abrirEditorControlada = titulo => {
+    app.hide('ctrl-list-view'); app.show('ctrl-editor-view');
+    app.el('ctrl-editor-titulo').textContent=titulo;
+    const r=controladaEmEdicao;
+    app.setVal('ctrl-data',r.data);
+    app.setVal('ctrl-end-emitente',r.endEmitente||appData.config.end1||'');
+    app.setVal('ctrl-paciente',r.paciente);
+    app.setVal('ctrl-end-paciente',r.endPaciente||'');
+    app.setVal('ctrl-prescricao',r.prescricao||'');
+    app.setVal('ctrl-comprador-nome',r.compradorNome||'');
+    app.setVal('ctrl-comprador-ident',r.compradorIdent||'');
+    app.setVal('ctrl-comprador-org',r.compradorOrg||'');
+    app.setVal('ctrl-comprador-end',r.compradorEnd||'');
+    app.setVal('ctrl-comprador-cidade',r.compradorCidade||'');
+    app.setVal('ctrl-comprador-uf',r.compradorUF||'');
+    app.setVal('ctrl-comprador-tel',r.compradorTel||'');
+    // Popular select médicos
+    const selMed=app.el('ctrl-medico');
+    selMed.innerHTML='<option value="">— Selecione o médico —</option>'+
+        [...appData.medicos].sort((a,b)=>a.nome.localeCompare(b.nome))
+            .map(m=>`<option value="${m.id}" data-crm="${m.crm}">${m.nome}${m.crm?' — '+m.crm:''}</option>`).join('');
+    selMed.value=r.medicoId||'';
+    selMed.onchange=()=>{ const opt=selMed.options[selMed.selectedIndex]; app.setVal('ctrl-crm',opt?opt.dataset.crm||'':''); };
+    if(r.medicoId){ const opt=selMed.querySelector(`option[value="${r.medicoId}"]`); if(opt) app.setVal('ctrl-crm',opt.dataset.crm||''); }
+    const btnImp=app.el('btn-imprimir-ctrl');
+    if(btnImp) btnImp.style.display=r.id?'inline-flex':'none';
+    // Popular select de medicamentos cadastrados
+    const selMedCtrl=app.el('ctrl-med-select');
+    if(selMedCtrl){
+        selMedCtrl.innerHTML='<option value="">+ Inserir medicamento cadastrado</option>'+
+            [...appData.medicamentos].sort((a,b)=>a.nome.localeCompare(b.nome))
+                .map(m=>`<option value="${m.id}">${m.nome}${m.dosagemQtd?' '+app.fmtDosagem(m.dosagemQtd,m.dosagemUnidade):''}</option>`).join('');
+    }
+};
+
+app.onCtrlMedSelect = () => {
+    const id=app.val('ctrl-med-select'); if(!id) return;
+    const m=appData.medicamentos.find(x=>x.id===id); if(!m) return;
+    const linha = m.nome + (m.dosagemQtd?' '+app.fmtDosagem(m.dosagemQtd,m.dosagemUnidade):'');
+    const atual = app.val('ctrl-prescricao').trim();
+    app.setVal('ctrl-prescricao', atual ? atual+'\n'+linha : linha);
+    app.setVal('ctrl-med-select','');
+};
+
+app.saveControlada = async () => {
+    const pac=app.toTitleCase(app.val('ctrl-paciente').trim());
+    if(!pac) return app.toast('Informe o nome do paciente.','err');
+    const selMed=app.el('ctrl-medico'), medicoId=selMed.value;
+    if(!medicoId) return app.toast('Selecione o médico.','err');
+    const prescricao=app.val('ctrl-prescricao').trim();
+    if(!prescricao) return app.toast('Informe a prescrição.','err');
+    const opt=selMed.options[selMed.selectedIndex];
+    const obj={
+        ...controladaEmEdicao,
+        id:controladaEmEdicao.id||app.gerarIdCtrl(),
+        paciente:pac, medicoId,
+        medico:opt?opt.textContent.split(' — ')[0]:'',
+        crm:opt?opt.dataset.crm||'':'',
+        data:app.val('ctrl-data'),
+        endEmitente:app.val('ctrl-end-emitente').trim(),
+        endPaciente:app.val('ctrl-end-paciente').trim(),
+        prescricao,
+        compradorNome:app.toTitleCase(app.val('ctrl-comprador-nome').trim()),
+        compradorIdent:app.val('ctrl-comprador-ident').trim(),
+        compradorOrg:app.val('ctrl-comprador-org').trim().toUpperCase(),
+        compradorEnd:app.val('ctrl-comprador-end').trim(),
+        compradorCidade:app.toTitleCase(app.val('ctrl-comprador-cidade').trim()),
+        compradorUF:app.val('ctrl-comprador-uf').trim().toUpperCase(),
+        compradorTel:app.val('ctrl-comprador-tel').trim()
+    };
+    if(!appData.controladas) appData.controladas=[];
+    if(controladaEmEdicao.id){ const i=appData.controladas.findIndex(x=>x.id===controladaEmEdicao.id); if(i>=0) appData.controladas[i]=obj; } else appData.controladas.push(obj);
+    controladaEmEdicao=obj;
+    await app.save('controladas'); app.toast('Receita controlada salva!');
+    const btnImp=app.el('btn-imprimir-ctrl'); if(btnImp) btnImp.style.display='inline-flex';
+};
+
+app.gerarIdCtrl = () => {
+    const d=new Date(),y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,'0'),day=String(d.getDate()).padStart(2,'0'),pref=`RC${y}.${m}.${day}`;
+    const ex=(appData.controladas||[]).filter(r=>r.id&&r.id.startsWith(pref)).map(r=>parseInt(r.id.split('-')[1])||0);
+    return `${pref}-${String(ex.length>0?Math.max(...ex)+1:1).padStart(3,'0')}`;
+};
+
+app.imprimirControlada = recId => {
+    const rec = recId ? (appData.controladas||[]).find(r=>r.id===recId) : controladaEmEdicao;
+    if(!rec) return app.toast('Receita não encontrada.','err');
+    const cfg = appData.config;
+    const medicoObj = appData.medicos.find(m=>m.id===rec.medicoId);
+    const medicoNome = rec.medico||(medicoObj?medicoObj.nome:'');
+    const medicoCrm  = rec.crm||(medicoObj?medicoObj.crm:'');
+    const assinatura = medicoObj?.assinatura||'';
+    const fmtData    = new Date(rec.data+'T12:00:00').toLocaleDateString('pt-BR');
+
+    const gerarVia = (via) => `
+<div class="ctrl-page">
+
+    <!-- TÍTULO CENTRALIZADO -->
+    <div style="text-align:center;margin-bottom:14px;">
+        <p style="font-size:17px;font-weight:900;text-transform:uppercase;letter-spacing:0.06em;color:#000;margin:0;font-family:'Inter',sans-serif;">Receita de Controle Especial</p>
+    </div>
+
+    <!-- CABEÇALHO: BOX CLÍNICA (metade) + VIAS (metade) -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0;border:1.5px solid #000;margin-bottom:24px;">
+        <div style="padding:10px 14px;border-right:1px solid #000;">
+            <p style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#000;margin:0 0 5px 0;font-family:'Inter',sans-serif;">Identificação do Emitente</p>
+            <p style="font-size:12px;font-weight:700;color:#000;margin:0 0 3px 0;font-family:'Inter',sans-serif;">TricoMaster Medicina Capilar</p>
+            <p style="font-size:11px;color:#000;margin:0 0 2px 0;font-family:'Inter',sans-serif;">CNPJ: 49.761.493/0001-71</p>
+            <p style="font-size:11px;color:#000;margin:0 0 2px 0;font-family:'Inter',sans-serif;">Rua Emílio Mallet, 1166</p>
+            ${cfg.tel?`<p style="font-size:11px;color:#000;margin:0;font-family:'Inter',sans-serif;">Tel: ${cfg.tel}${cfg.wpp?' · '+cfg.wpp:''}</p>`:''}
+        </div>
+        <div style="padding:10px 14px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;">
+            <p style="font-size:12px;font-weight:700;color:#000;margin:0;text-align:center;font-family:'Inter',sans-serif;${via===1?'text-decoration:underline;':''}">1ª Via — Retenção da Farmácia</p>
+            <p style="font-size:12px;font-weight:700;color:#000;margin:0;text-align:center;font-family:'Inter',sans-serif;${via===2?'text-decoration:underline;':''}">2ª Via — Orientação ao Paciente</p>
+        </div>
+    </div>
+
+    <!-- PACIENTE -->
+    <div style="margin-bottom:18px;">
+        <p style="font-size:13px;color:#000;margin:0;font-family:'Inter',sans-serif;"><strong>Paciente:</strong> ${rec.paciente||''}</p>
+    </div>
+
+    <!-- ENDEREÇO -->
+    <div style="margin-bottom:24px;">
+        <p style="font-size:13px;color:#000;margin:0;font-family:'Inter',sans-serif;"><strong>Endereço:</strong> ${rec.endPaciente||''}</p>
+    </div>
+
+    <!-- PRESCRIÇÃO -->
+    <div style="margin-bottom:24px;">
+        <p style="font-size:13px;font-weight:700;color:#000;margin:0 0 10px 0;font-family:'Inter',sans-serif;">Prescrição:</p>
+        <div style="font-size:13px;color:#000;line-height:2.1;white-space:pre-line;font-family:'Inter',sans-serif;">${rec.prescricao||''}</div>
+    </div>
+
+    <!-- RODAPÉ FIXO NA BASE DA PÁGINA -->
+    <div class="ctrl-footer">
+        <!-- DATA + ASSINATURA -->
+        <div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:20px;">
+            <div style="font-size:13px;color:#000;font-family:'Inter',sans-serif;">Data: ${fmtData}</div>
+            <div style="text-align:center;min-width:200px;">
+                ${assinatura
+                    ? `<img src="${assinatura}" style="height:88px;max-width:220px;object-fit:contain;display:block;margin:0 auto 4px;">`
+                    : '<div style="height:88px;"></div>'}
+                <div style="border-top:1px solid #000;padding-top:5px;">
+                    <p style="font-size:12px;font-weight:700;color:#000;margin:0;font-family:'Inter',sans-serif;">${medicoNome}</p>
+                    <p style="font-size:11px;color:#000;margin:3px 0 0;font-family:'Inter',sans-serif;">CRM: ${medicoCrm}</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- DOIS BOXES: COMPRADOR + FORNECEDOR -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:0;border:1.5px solid #000;">
+            <div style="padding:8px 12px;border-right:1px solid #000;">
+                <p style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#000;margin:0 0 8px 0;text-align:center;font-family:'Inter',sans-serif;">Identificação do Comprador</p>
+                <div style="font-size:11px;color:#000;line-height:2;font-family:'Inter',sans-serif;">
+                    <div>Nome: ${rec.compradorNome||''}</div>
+                    <div>Ident.: ${rec.compradorIdent||''} &nbsp; Org. Emissor: ${rec.compradorOrg||''}</div>
+                    <div>End.: ${rec.compradorEnd||''}</div>
+                    <div>Cidade: ${rec.compradorCidade||''} &nbsp; UF: ${rec.compradorUF||''}</div>
+                    <div>Telefone: ${rec.compradorTel||''}</div>
+                </div>
+            </div>
+            <div style="padding:8px 12px;display:flex;flex-direction:column;">
+                <p style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#000;margin:0 0 8px 0;text-align:center;font-family:'Inter',sans-serif;">Identificação do Fornecedor</p>
+                <div style="flex:1;min-height:40px;"></div>
+                <div style="border-top:1px solid #000;padding-top:5px;">
+                    <p style="font-size:11px;color:#000;margin:0;text-align:center;font-family:'Inter',sans-serif;">Assinatura do Farmacêutico</p>
+                    <p style="font-size:11px;color:#000;margin:8px 0 0;text-align:right;font-family:'Inter',sans-serif;">___/___/___&nbsp; Data</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+</div>`;
+
+    const html = `
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;900&display=swap');
+    @page { size: A4; margin: 15mm; }
+    @media print {
+        body > *:not(#print-view) { display:none !important; }
+        #print-view { display:block !important; position:static !important; background:#fff !important; }
+        .print-controls { display:none !important; }
+        body { background:#fff !important; margin:0 !important; padding:0 !important; }
+        .ctrl-page { page-break-after:always; box-shadow:none !important; margin:0 !important; padding:0 !important; width:100% !important; height:auto !important; }
+        .ctrl-page:last-child { page-break-after:avoid; }
+        .ctrl-footer { position:fixed !important; bottom:15mm !important; left:15mm !important; right:15mm !important; }
+    }
+    .ctrl-page {
+        width: 210mm;
+        height: 267mm;
+        background: #fff;
+        padding: 15mm;
+        margin: 20px auto;
+        box-shadow: 0 0 15px rgba(0,0,0,0.12);
+        font-family: 'Inter', Arial, sans-serif;
+        box-sizing: border-box;
+        position: relative;
+        overflow: hidden;
+    }
+    .ctrl-footer {
+        position: absolute;
+        bottom: 15mm;
+        left: 15mm;
+        right: 15mm;
+    }
+</style>
+${gerarVia(1)}${gerarVia(2)}`;
+
+    app.el('print-content').innerHTML = html;
+    app.show('print-view');
+};
+
+// ─── MEDICAMENTOS (nome, dosagem, unidade) ────────────────────────────────────
+
+app.renderMedicamentos = () => {
+    const q=(app.val('med-search')||'').toLowerCase();
+    const lista=appData.medicamentos.filter(m=>m.nome.toLowerCase().includes(q)).sort((a,b)=>a.nome.localeCompare(b.nome));
+    const {items,page,pages,total}=app.paginate(lista,ui.medPage,ui.PER_PAGE);
+    ui.medPage=page;
+    const empty=app.el('med-empty'), table=app.el('med-table');
+    if(!lista.length){ empty.style.display='block'; table.style.display='none'; app.hide('med-pag'); return; }
+    empty.style.display='none'; table.style.display='table';
+    app.el('med-tbody').innerHTML=items.map(m=>`
+        <tr>
+            <td data-label="Nome"><span style="font-weight:600;color:#013425;">${m.nome}</span></td>
+            <td data-label="Dosagem"><span class="pill pill-gold">${app.fmtDosagem(m.dosagemQtd,m.dosagemUnidade)||'—'}</span></td>
+            <td data-label="Ações" style="text-align:center;">
+                <div style="display:flex;justify-content:center;gap:2px;">
+                    <button onclick="app.editMedicamento('${m.id}')" class="btn-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>
+                    <button onclick="app.deleteMedicamento('${m.id}')" class="btn-icon btn-danger"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3,6 5,6 21,6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg></button>
+                </div>
+            </td>
+        </tr>`).join('');
+    app.renderPag('med-pag',page,pages,total,"app.medPagePrev()","app.medPageNext()");
+};
+app.medPagePrev=()=>{ ui.medPage--; app.renderMedicamentos(); };
+app.medPageNext=()=>{ ui.medPage++; app.renderMedicamentos(); };
+
+app.saveMedicamento = async () => {
+    const id=app.val('med-id'), nome=app.toTitleCase(app.val('med-nome').trim());
+    if(!nome) return app.toast('Informe o nome do medicamento.','err');
+    const obj={id:id||app.uid(),nome,dosagemQtd:app.val('med-dosagem-qtd').trim(),dosagemUnidade:app.val('med-dosagem-unidade')};
+    if(id){ const i=appData.medicamentos.findIndex(m=>m.id===id); if(i>=0) appData.medicamentos[i]=obj; } else appData.medicamentos.push(obj);
+    app.resetMedForm(); app.renderMedicamentos(); await app.save('medicamentos'); app.toast('Medicamento salvo!');
+};
+
+app.editMedicamento = id => {
+    const m=appData.medicamentos.find(x=>x.id===id); if(!m) return;
+    app.setVal('med-id',m.id); app.setVal('med-nome',m.nome);
+    app.setVal('med-dosagem-qtd',m.dosagemQtd||''); app.setVal('med-dosagem-unidade',m.dosagemUnidade||'mg');
+    app.el('med-form-title').textContent='Editando Medicamento';
+    app.el('med-cancel-btn').style.display='inline-flex';
+};
+
+app.deleteMedicamento = async id => {
+    if(!confirm('Excluir medicamento?')) return;
+    appData.medicamentos=appData.medicamentos.filter(m=>m.id!==id);
+    app.renderMedicamentos(); await app.save('medicamentos'); app.toast('Excluído.');
+};
+
+app.resetMedForm = () => {
+    ['med-id','med-nome','med-dosagem-qtd'].forEach(id=>app.setVal(id,''));
+    app.setVal('med-dosagem-unidade','mg');
+    app.el('med-form-title').textContent='Novo Medicamento';
+    app.el('med-cancel-btn').style.display='none';
+};
+
+// ─── POSOLOGIAS PADRÃO ────────────────────────────────────────────────────────
+
+app.renderPosologias = () => {
+    const lista=app.el('posologias-lista'), empty=app.el('posologias-empty');
+    if(!appData.posologias||!appData.posologias.length){ lista.innerHTML=''; empty.style.display='block'; return; }
+    empty.style.display='none';
+    lista.innerHTML=[...appData.posologias].map(p=>`
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px;padding:10px 12px;background:#f9fafb;border-radius:8px;border:1px solid #eee;margin-bottom:6px;">
+            <p style="font-size:13px;color:#333;flex:1;margin:0;line-height:1.6;">${p.texto}</p>
+            <div style="display:flex;gap:4px;flex-shrink:0;">
+                <button onclick="app.editPosologia('${p.id}')" class="btn-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>
+                <button onclick="app.deletePosologia('${p.id}')" class="btn-icon btn-danger"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3,6 5,6 21,6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg></button>
+            </div>
+        </div>`).join('');
+};
+
+app.savePosologia = async () => {
+    const id=app.val('posologia-edit-id'), texto=app.val('posologia-texto').trim();
+    if(!texto) return app.toast('Informe o texto da posologia.','err');
+    const obj={id:id||app.uid(),texto};
+    if(id){ const i=appData.posologias.findIndex(p=>p.id===id); if(i>=0) appData.posologias[i]=obj; } else appData.posologias.push(obj);
+    app.resetPosologiaForm(); app.renderPosologias(); await app.save('posologias'); app.toast('Posologia salva!');
+};
+
+app.editPosologia = id => {
+    const p=appData.posologias.find(x=>x.id===id); if(!p) return;
+    app.setVal('posologia-edit-id',p.id); app.setVal('posologia-texto',p.texto);
+    app.el('posologia-cancel-btn').style.display='inline-flex';
+};
+
+app.deletePosologia = async id => {
+    if(!confirm('Excluir posologia?')) return;
+    appData.posologias=appData.posologias.filter(p=>p.id!==id);
+    app.renderPosologias(); await app.save('posologias'); app.toast('Posologia excluída.');
+};
+
+app.resetPosologiaForm = () => {
+    app.setVal('posologia-edit-id',''); app.setVal('posologia-texto','');
+    app.el('posologia-cancel-btn').style.display='none';
+};
+
+app._popularSelectPosologia = (selectId) => {
+    const sel=app.el(selectId); if(!sel) return;
+    sel.innerHTML='<option value="">— Inserir posologia padrão —</option>'+
+        (appData.posologias||[]).map(p=>`<option value="${p.id}">${p.texto.length>70?p.texto.slice(0,70)+'…':p.texto}</option>`).join('');
+};
+
+// ─── MODAL ADD MEDICAMENTO ────────────────────────────────────────────────────
+
+app.abrirModalAddMed = (contexto) => {
+    modalContexto=contexto||'receita';
+    app.el('modal-add-med-titulo').textContent=modalContexto==='receita'?'Adicionar Medicamento à Receita':'Adicionar Medicamento à Fórmula';
+    const sel=app.el('modal-med-select');
+    sel.innerHTML='<option value="">— Selecione ou preencha manualmente —</option>'+
+        [...appData.medicamentos].sort((a,b)=>a.nome.localeCompare(b.nome))
+            .map(m=>`<option value="${m.id}" data-qtd="${m.dosagemQtd||''}" data-un="${m.dosagemUnidade||'mg'}">${m.nome}${m.dosagemQtd?' — '+app.fmtDosagem(m.dosagemQtd,m.dosagemUnidade):''}</option>`).join('');
+    app.setVal('modal-med-select',''); app.setVal('modal-med-nome','');
+    app.setVal('modal-med-dosagem-qtd',''); app.setVal('modal-med-dosagem-unidade','mg');
+    app.setVal('modal-med-posologia',''); app.setVal('modal-med-qtd','');
+    // Mostrar campo de posologia por medicamento somente na receita
+    const wrap=app.el('modal-posologia-med-wrap');
+    if(wrap) wrap.style.display=modalContexto==='receita'?'block':'none';
+    // Popular select de posologias no modal
+    app._popularSelectPosologia('modal-posologia-select');
+    app.show('modal-add-med','flex');
+};
+
+app.onModalPosologiaSelect = () => {
+    const id=app.val('modal-posologia-select'); if(!id) return;
+    const p=appData.posologias.find(x=>x.id===id); if(!p) return;
+    const atual=app.val('modal-med-posologia').trim();
+    app.setVal('modal-med-posologia',atual?atual+'\n'+p.texto:p.texto);
+    app.setVal('modal-posologia-select','');
+};
+
+app.onModalMedSelect = () => {
+    const sel=app.el('modal-med-select'), id=sel.value; if(!id) return;
+    const opt=sel.options[sel.selectedIndex];
+    app.setVal('modal-med-nome',opt.textContent.split(' — ')[0]);
+    app.setVal('modal-med-dosagem-qtd',opt.dataset.qtd||'');
+    app.setVal('modal-med-dosagem-unidade',opt.dataset.un||'mg');
+};
+
+app.fecharModalAddMed = () => {
+    app.hide('modal-add-med');
+    // Garantir que o botão sempre volta ao estado "Adicionar"
+    const btnConfirmar = document.querySelector('#modal-add-med .btn-primary');
+    if(btnConfirmar){
+        btnConfirmar.textContent = 'Adicionar';
+        btnConfirmar.onclick = app.confirmarAddMed;
+    }
+    app.el('modal-add-med-titulo').textContent = 'Adicionar Medicamento';
+};
+
+app.confirmarAddMed = () => {
+    const nome=app.toTitleCase(app.val('modal-med-nome').trim());
+    if(!nome) return app.toast('Informe o nome do medicamento.','err');
+    const posologiaMed = modalContexto==='receita' ? app.val('modal-med-posologia').trim() : '';
+    const qtdMed = modalContexto==='receita' ? app.val('modal-med-qtd').trim() : '';
+    const item={id:app.uid(),refId:app.val('modal-med-select')||null,nome,
+        dosagemQtd:app.val('modal-med-dosagem-qtd').trim(),dosagemUnidade:app.val('modal-med-dosagem-unidade'),
+        posologiaMed, qtdMed};
+    if(modalContexto==='receita'){
+        if(!receitaEmEdicao.medicamentos) receitaEmEdicao.medicamentos=[];
+        receitaEmEdicao.medicamentos.push(item); app.renderReceitaMeds();
+    } else {
+        if(!formulaEmEdicao.medicamentos) formulaEmEdicao.medicamentos=[];
+        formulaEmEdicao.medicamentos.push(item); app.renderFormulaMeds();
+    }
+    app.fecharModalAddMed();
+};
+
+// ─── RENDER MEDS ─────────────────────────────────────────────────────────────
+
+app.renderReceitaMeds = () => {
+    const lista=receitaEmEdicao.medicamentos||[];
+    const c=app.el('rec-meds-lista');
+    const resumo=app.el('rec-resumo-meds');
+    const totalEl=app.el('rec-total-itens');
+    if(totalEl) totalEl.textContent=lista.length;
+    if(!lista.length){
+        c.innerHTML='<div class="empty-state" style="padding:24px;border:1.5px dashed #e0e7e3;border-radius:10px;color:#bbb;">Nenhum medicamento adicionado</div>';
+        if(resumo) resumo.innerHTML='<span style="color:#5a8a77;">Nenhum medicamento</span>';
+        return;
+    }
+    if(resumo) resumo.innerHTML=lista.map((m,i)=>`
+        <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+            <span>${i+1}. ${m.nome}</span>
+            <span style="color:#C5A365;font-size:12px;">${app.fmtDosagem(m.dosagemQtd,m.dosagemUnidade)||''}</span>
+        </div>`).join('');
+    c.innerHTML=lista.map((m,i)=>`
+        <div style="background:#f9fafb;border-radius:8px;border:1px solid #eee;margin-bottom:6px;overflow:hidden;">
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;">
+                <div>
+                    <span style="font-weight:600;font-size:14px;color:#013425;">${m.nome}</span>
+                    ${m.dosagemQtd?`<span class="pill pill-gold" style="margin-left:8px;">${app.fmtDosagem(m.dosagemQtd,m.dosagemUnidade)}</span>`:''}
+                    ${m.qtdMed?`<span style="font-size:12px;color:#888;margin-left:6px;">· Qtd: ${m.qtdMed}</span>`:''}
+                </div>
+                <div style="display:flex;gap:4px;">
+                    <button onclick="app.editRecMed(${i})" class="btn-icon btn-gold" title="Editar"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>
+                    <button onclick="app.removeRecMed(${i})" class="btn-icon btn-danger" title="Excluir"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+                </div>
+            </div>
+            ${m.posologiaMed?`<div style="padding:6px 14px 10px;font-size:12px;color:#666;border-top:1px solid #eee;"><strong style="color:#C5A365;font-size:10px;text-transform:uppercase;letter-spacing:0.04em;">Posologia específica: </strong>${m.posologiaMed}</div>`:''}
+        </div>`).join('');
+};
+app.removeRecMed = i => { receitaEmEdicao.medicamentos.splice(i,1); app.renderReceitaMeds(); };
+
+app.editRecMed = i => {
+    const m = receitaEmEdicao.medicamentos[i];
+    if(!m) return;
+    // Abre o modal no modo edição
+    modalContexto = 'receita';
+    app.el('modal-add-med-titulo').textContent = `Editando — ${m.nome}`;
+    // Popular select de medicamentos
+    const sel=app.el('modal-med-select');
+    sel.innerHTML='<option value="">— Selecione ou preencha manualmente —</option>'+
+        [...appData.medicamentos].sort((a,b)=>a.nome.localeCompare(b.nome))
+            .map(med=>`<option value="${med.id}" data-qtd="${med.dosagemQtd||''}" data-un="${med.dosagemUnidade||'mg'}">${med.nome}${med.dosagemQtd?' — '+app.fmtDosagem(med.dosagemQtd,med.dosagemUnidade):''}</option>`).join('');
+    // Preencher campos com os dados atuais
+    app.setVal('modal-med-select', m.refId||'');
+    app.setVal('modal-med-nome', m.nome);
+    app.setVal('modal-med-dosagem-qtd', m.dosagemQtd||'');
+    app.setVal('modal-med-dosagem-unidade', m.dosagemUnidade||'mg');
+    app.setVal('modal-med-posologia', m.posologiaMed||'');
+    app.setVal('modal-med-qtd', m.qtdMed||'');
+    // Mostrar campo de posologia
+    const wrap=app.el('modal-posologia-med-wrap');
+    if(wrap) wrap.style.display='block';
+    app._popularSelectPosologia('modal-posologia-select');
+    // Trocar botão "Adicionar" por "Salvar alterações"
+    const btnConfirmar = document.querySelector('#modal-add-med .btn-primary');
+    if(btnConfirmar){
+        btnConfirmar.textContent = 'Salvar Alterações';
+        btnConfirmar.onclick = () => app.salvarEdicaoRecMed(i);
+    }
+    app.show('modal-add-med','flex');
+};
+
+app.salvarEdicaoRecMed = i => {
+    const nome=app.toTitleCase(app.val('modal-med-nome').trim());
+    if(!nome) return app.toast('Informe o nome do medicamento.','err');
+    receitaEmEdicao.medicamentos[i] = {
+        ...receitaEmEdicao.medicamentos[i],
+        nome,
+        dosagemQtd: app.val('modal-med-dosagem-qtd').trim(),
+        dosagemUnidade: app.val('modal-med-dosagem-unidade'),
+        posologiaMed: app.val('modal-med-posologia').trim(),
+        qtdMed: app.val('modal-med-qtd').trim()
+    };
+    // Restaurar botão para modo "Adicionar"
+    const btnConfirmar = document.querySelector('#modal-add-med .btn-primary');
+    if(btnConfirmar){
+        btnConfirmar.textContent = 'Adicionar';
+        btnConfirmar.onclick = app.confirmarAddMed;
+    }
+    app.fecharModalAddMed();
+    app.renderReceitaMeds();
+    app.toast('Medicamento atualizado!');
+};
+
+app.renderFormulaMeds = () => {
+    const lista=formulaEmEdicao.medicamentos||[];
+    const c=app.el('form-meds-lista');
+    if(!lista.length){
+        c.innerHTML='<div class="empty-state" style="padding:24px;border:1.5px dashed #e0e7e3;border-radius:10px;color:#bbb;">Nenhum medicamento adicionado</div>';
+        return;
+    }
+    c.innerHTML=lista.map((m,i)=>`
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:#f9fafb;border-radius:8px;border:1px solid #eee;margin-bottom:6px;">
+            <div>
+                <span style="font-weight:600;font-size:14px;color:#013425;">${m.nome}</span>
+                ${m.dosagemQtd?`<span class="pill pill-gold" style="margin-left:8px;">${app.fmtDosagem(m.dosagemQtd,m.dosagemUnidade)}</span>`:''}
+            </div>
+            <button onclick="app.removeFormulaMed(${i})" class="btn-icon btn-danger"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+        </div>`).join('');
+};
+app.removeFormulaMed = i => { formulaEmEdicao.medicamentos.splice(i,1); app.renderFormulaMeds(); };
+
+// ─── FÓRMULAS ─────────────────────────────────────────────────────────────────
+
+app.renderFormulaList = () => {
+    app.show('form-list-view'); app.hide('form-editor-view');
+    const q=(app.val('form-search')||'').toLowerCase();
+    const lista=appData.formulas.filter(f=>(f.nome||'').toLowerCase().includes(q)).sort((a,b)=>a.nome.localeCompare(b.nome));
+    const {items,page,pages,total}=app.paginate(lista,ui.formPage,ui.PER_PAGE);
+    ui.formPage=page;
+    const empty=app.el('form-empty'), listaEl=app.el('form-lista');
+    if(!lista.length){ empty.style.display='block'; listaEl.innerHTML=''; app.hide('form-pag'); return; }
+    empty.style.display='none';
+    listaEl.innerHTML=items.map(f=>`
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;padding:14px 16px;border-bottom:1px solid #f0f0f0;">
+            <div style="flex:1;min-width:0;">
+                <p style="font-weight:600;font-size:14px;color:#013425;">${f.nome}</p>
+                <p style="font-size:12px;color:#888;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+                    ${f.medicamentos?.length
+                        ? f.medicamentos.map(m=>m.nome).join(' · ')
+                        : '<em>Sem medicamentos</em>'}
+                </p>
+                ${(f.apresentacao||f.desc)?`<p style="font-size:11px;color:#aaa;margin-top:2px;">${[f.apresentacao,f.desc].filter(Boolean).join(' · ')}</p>`:''}
+            </div>
+            <div style="display:flex;gap:4px;flex-shrink:0;margin-left:12px;">
+                <button onclick="app.editFormula('${f.id}')" class="btn-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>
+                <button onclick="app.copyFormula('${f.id}')" class="btn-icon btn-gold" title="Duplicar"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
+                <button onclick="app.deleteFormula('${f.id}')" class="btn-icon btn-danger"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3,6 5,6 21,6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg></button>
+            </div>
+        </div>`).join('');
+    app.renderPag('form-pag',page,pages,total,"app.formPagePrev()","app.formPageNext()");
+};
+app.formPagePrev=()=>{ ui.formPage--; app.renderFormulaList(); };
+app.formPageNext=()=>{ ui.formPage++; app.renderFormulaList(); };
+
+app.novaFormula = () => {
+    formulaEmEdicao={id:null,nome:'',desc:'',apresentacao:'',posologia:'',obs:'',medicamentos:[]};
+    app.hide('form-list-view'); app.show('form-editor-view');
+    app.el('form-editor-titulo').textContent='Nova Fórmula';
+    app.setVal('form-nome',''); app.setVal('form-desc','');
+    app.setVal('form-apresentacao',''); app.setVal('form-apresentacao-livre','');
+    const w=app.el('form-apresentacao-livre-wrap'); if(w) w.style.display='none';
+    app.setVal('form-posologia',''); app.setVal('form-obs','');
+    app._popularSelectPosologia('form-posologia-select');
+    app.renderFormulaMeds();
+};
+
+app.editFormula = id => {
+    const f=appData.formulas.find(x=>x.id===id); if(!f) return;
+    formulaEmEdicao=JSON.parse(JSON.stringify(f));
+    app.hide('form-list-view'); app.show('form-editor-view');
+    app.el('form-editor-titulo').textContent='Editando Fórmula';
+    app.setVal('form-nome',f.nome); app.setVal('form-desc',f.desc||'');
+    // Apresentação
+    const apres = f.apresentacao||'';
+    const apresOpts = ['Cápsula','Comprimido','Frasco','Sachê','Creme','Gel','Pomada','Solução','Ampola','Spray','Gotas','Adesivo'];
+    if(apresOpts.includes(apres)){
+        app.setVal('form-apresentacao',apres); app.setVal('form-apresentacao-livre','');
+        const w=app.el('form-apresentacao-livre-wrap'); if(w) w.style.display='none';
+    } else if(apres){
+        app.setVal('form-apresentacao','livre'); app.setVal('form-apresentacao-livre',apres);
+        const w=app.el('form-apresentacao-livre-wrap'); if(w) w.style.display='block';
+    } else {
+        app.setVal('form-apresentacao',''); app.setVal('form-apresentacao-livre','');
+        const w=app.el('form-apresentacao-livre-wrap'); if(w) w.style.display='none';
+    }
+    app.setVal('form-posologia',f.posologia||''); app.setVal('form-obs',f.obs||'');
+    app._popularSelectPosologia('form-posologia-select');
+    app.renderFormulaMeds();
+};
+
+app.voltarFormulaList = () => app.renderFormulaList();
+
+app.copyFormula = id => {
+    const f=appData.formulas.find(x=>x.id===id); if(!f) return;
+    const copia=JSON.parse(JSON.stringify(f)); copia.id=app.uid(); copia.nome=copia.nome+' (cópia)';
+    appData.formulas.push(copia); app.save('formulas'); app.renderFormulaList(); app.toast('Fórmula duplicada!');
+};
+
+app.deleteFormula = async id => {
+    if(!confirm('Excluir fórmula?')) return;
+    appData.formulas=appData.formulas.filter(f=>f.id!==id);
+    app.renderFormulaList(); await app.save('formulas'); app.toast('Excluído.');
+};
+
+app.onFormPosologiaSelect = () => {
+    const id=app.val('form-posologia-select'); if(!id) return;
+    const p=appData.posologias.find(x=>x.id===id); if(!p) return;
+    const atual=app.val('form-posologia').trim();
+    app.setVal('form-posologia',atual?atual+'\n'+p.texto:p.texto);
+    app.setVal('form-posologia-select','');
+};
+
+app.saveFormula = async () => {
+    const nome=app.toTitleCase(app.val('form-nome').trim());
+    if(!nome) return app.toast('Informe o nome da fórmula.','err');
+    formulaEmEdicao.nome=nome; formulaEmEdicao.desc=app.val('form-desc').trim();
+    formulaEmEdicao.apresentacao=app._getApresentacaoTexto();
+    formulaEmEdicao.posologia=app.val('form-posologia').trim();
+    formulaEmEdicao.obs=app.val('form-obs').trim();
+    const obj={...formulaEmEdicao,id:formulaEmEdicao.id||app.uid()};
+    if(formulaEmEdicao.id){ const i=appData.formulas.findIndex(x=>x.id===formulaEmEdicao.id); if(i>=0) appData.formulas[i]=obj; } else appData.formulas.push(obj);
+    await app.save('formulas'); app.toast('Fórmula salva!'); app.renderFormulaList();
+};
+
+// ─── RECEITAS ─────────────────────────────────────────────────────────────────
+
+app.renderReceitaList = () => {
+    app.show('rec-list-view'); app.hide('rec-editor-view');
+    const q=(app.val('rec-search')||'').toLowerCase();
+    const lista=appData.receitas
+        .filter(r=>(r.paciente||'').toLowerCase().includes(q)||(r.medico||'').toLowerCase().includes(q))
+        .sort((a,b)=>new Date(b.data)-new Date(a.data));
+    const {items,page,pages,total}=app.paginate(lista,ui.recPage,ui.PER_PAGE);
+    ui.recPage=page;
+    const empty=app.el('rec-empty'), table=app.el('rec-table');
+    if(!lista.length){ empty.style.display='block'; table.style.display='none'; app.hide('rec-pag'); return; }
+    empty.style.display='none'; table.style.display='table';
+    app.el('rec-tbody').innerHTML=items.map(r=>`
+        <tr>
+            <td data-label="#">${r.id}</td>
+            <td data-label="Data">${new Date(r.data+'T12:00:00').toLocaleDateString('pt-BR')}</td>
+            <td data-label="Paciente" style="font-weight:500;">${r.paciente}</td>
+            <td data-label="Médico" style="font-size:13px;color:#013425;font-weight:500;">${r.medico||'—'}</td>
+            <td data-label="CRM" style="font-size:12px;color:#888;">${r.crm||'—'}</td>
+            <td data-label="Ações" style="text-align:center;">
+                <div style="display:flex;justify-content:center;gap:3px;">
+                    <button onclick="app.imprimirReceita('${r.id}')" class="btn-icon" title="Imprimir"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6,9 6,2 18,2 18,9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg></button>
+                    <button onclick="app.editReceita('${r.id}')" class="btn-icon" title="Editar"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>
+                    <button onclick="app.deleteReceita('${r.id}')" class="btn-icon btn-danger" title="Excluir"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3,6 5,6 21,6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg></button>
+                </div>
+            </td>
+        </tr>`).join('');
+    app.renderPag('rec-pag',page,pages,total,"app.recPagePrev()","app.recPageNext()");
+};
+app.recPagePrev=()=>{ ui.recPage--; app.renderReceitaList(); };
+app.recPageNext=()=>{ ui.recPage++; app.renderReceitaList(); };
+
+app.novaReceita = () => {
+    receitaEmEdicao={id:null,paciente:'',medicoId:'',medico:'',crm:'',especialidade:'',data:new Date().toISOString().slice(0,10),diagnostico:'',formaUso:'oral',formaUsoLivre:'',apresentacao:'',apresentacaoLivre:'',apresentacaoQtd:'',posologia:'',obs:'',medicamentos:[]};
+    app.abrirEditorReceita('Nova Receita');
+};
+
+app.editReceita = id => {
+    const r=appData.receitas.find(x=>x.id===id); if(!r) return;
+    receitaEmEdicao=JSON.parse(JSON.stringify(r));
+    app.abrirEditorReceita(`Editando #${id}`);
+};
+
+app.deleteReceita = async id => {
+    if(!confirm('Excluir receita?')) return;
+    appData.receitas=appData.receitas.filter(r=>r.id!==id);
+    app.renderReceitaList(); await app.save('receitas'); app.toast('Excluída.');
+};
+
+app.voltarReceitaList = () => app.renderReceitaList();
+
+app.abrirEditorReceita = titulo => {
+    app.hide('rec-list-view'); app.show('rec-editor-view');
+    app.el('rec-editor-titulo').textContent=titulo;
+    const r=receitaEmEdicao;
+    app.setVal('rec-paciente',r.paciente);
+    app.setVal('rec-data',r.data);
+    app.setVal('rec-diagnostico',r.diagnostico||'');
+    app.setVal('rec-posologia',r.posologia||'');
+    app.setVal('rec-obs',r.obs||'');
+
+    // Forma de uso
+    const formaUso = r.formaUso || 'oral';
+    app.setVal('rec-forma-uso', formaUso);
+    app.setVal('rec-forma-uso-livre', r.formaUsoLivre||'');
+    const wFU=app.el('rec-forma-uso-livre-wrap');
+    if(wFU) wFU.style.display = formaUso==='livre' ? 'block' : 'none';
+
+    // Apresentação
+    const apres = r.apresentacao||'';
+    const apresOpts = ['Cápsula','Comprimido','Frasco','Sachê','Creme','Gel','Pomada','Solução','Ampola','Spray','Gotas','Adesivo'];
+    if(apresOpts.includes(apres)){
+        app.setVal('rec-apresentacao', apres); app.setVal('rec-apresentacao-livre','');
+        const wA=app.el('rec-apresentacao-livre-wrap'); if(wA) wA.style.display='none';
+    } else if(apres){
+        app.setVal('rec-apresentacao','livre'); app.setVal('rec-apresentacao-livre', apres);
+        const wA=app.el('rec-apresentacao-livre-wrap'); if(wA) wA.style.display='block';
+    } else {
+        app.setVal('rec-apresentacao',''); app.setVal('rec-apresentacao-livre','');
+        const wA=app.el('rec-apresentacao-livre-wrap'); if(wA) wA.style.display='none';
+    }
+    app.setVal('rec-apresentacao-qtd', r.apresentacaoQtd||'');
+
+    const selMed=app.el('rec-medico');
+    selMed.innerHTML='<option value="">— Selecione o médico —</option>'+
+        [...appData.medicos].sort((a,b)=>a.nome.localeCompare(b.nome))
+            .map(m=>`<option value="${m.id}" data-crm="${m.crm}" data-esp="${m.especialidade||''}">${m.nome}${m.crm?' — '+m.crm:''}</option>`).join('');
+    selMed.value=r.medicoId||'';
+    selMed.onchange=()=>{ const opt=selMed.options[selMed.selectedIndex]; app.setVal('rec-crm',opt?opt.dataset.crm||'':''); };
+    if(r.medicoId){ const opt=selMed.querySelector(`option[value="${r.medicoId}"]`); if(opt) app.setVal('rec-crm',opt.dataset.crm||''); }
+
+    const selForm=app.el('rec-formula-select');
+    selForm.innerHTML='<option value="">📋 Usar Fórmula...</option>'+
+        [...appData.formulas].sort((a,b)=>a.nome.localeCompare(b.nome))
+            .map(f=>`<option value="${f.id}">${f.nome}</option>`).join('');
+
+    app._popularSelectPosologia('rec-posologia-select');
+    app.setVal('rec-posologia-select','');
+
+    const btnImp=app.el('btn-imprimir-rec');
+    if(btnImp) btnImp.style.display=r.id?'inline-flex':'none';
+
+    app.renderReceitaMeds();
+};
+
+app.onRecPosologiaSelect = () => {
+    const id=app.val('rec-posologia-select'); if(!id) return;
+    const p=appData.posologias.find(x=>x.id===id); if(!p) return;
+    const atual=app.val('rec-posologia').trim();
+    app.setVal('rec-posologia',atual?atual+'\n'+p.texto:p.texto);
+    app.setVal('rec-posologia-select','');
+};
+
+app.carregarFormula = () => {
+    const id=app.val('rec-formula-select'); if(!id) return;
+    const f=appData.formulas.find(x=>x.id===id); if(!f) return;
+    if(receitaEmEdicao.medicamentos?.length>0){
+        if(!confirm('Carregar esta fórmula substituirá os medicamentos atuais. Continuar?')){
+            app.setVal('rec-formula-select',''); return;
+        }
+    }
+    receitaEmEdicao.medicamentos=JSON.parse(JSON.stringify(f.medicamentos||[])).map(m=>({...m,id:app.uid()}));
+    if(f.posologia) app.setVal('rec-posologia', f.posologia);
+    if(f.obs)       app.setVal('rec-obs', f.obs);
+    // Puxar apresentação da fórmula para a receita
+    if(f.apresentacao){
+        const apresOpts=['Cápsula','Comprimido','Frasco','Sachê','Creme','Gel','Pomada','Solução','Ampola','Spray','Gotas','Adesivo'];
+        if(apresOpts.includes(f.apresentacao)){
+            app.setVal('rec-apresentacao', f.apresentacao);
+            app.setVal('rec-apresentacao-livre','');
+            const w=app.el('rec-apresentacao-livre-wrap'); if(w) w.style.display='none';
+        } else {
+            app.setVal('rec-apresentacao','livre');
+            app.setVal('rec-apresentacao-livre', f.apresentacao);
+            const w=app.el('rec-apresentacao-livre-wrap'); if(w) w.style.display='block';
+        }
+    }
+    app.renderReceitaMeds();
+    app.toast(`Fórmula "${f.nome}" carregada!`);
+};
+
+app.saveReceita = async () => {
+    const pac=app.toTitleCase(app.val('rec-paciente').trim());
+    if(!pac) return app.toast('Informe o nome do paciente.','err');
+    const selMed=app.el('rec-medico'), medicoId=selMed.value;
+    if(!medicoId) return app.toast('Selecione o médico.','err');
+    if(!receitaEmEdicao.medicamentos?.length) return app.toast('Adicione pelo menos um medicamento.','err');
+    const opt=selMed.options[selMed.selectedIndex];
+    const obj={
+        ...receitaEmEdicao,
+        id:receitaEmEdicao.id||app.gerarIdRec(),
+        paciente:pac, medicoId,
+        medico:opt?opt.textContent.split(' — ')[0]:'',
+        crm:opt?opt.dataset.crm||'':'',
+        especialidade:opt?opt.dataset.esp||'':'',
+        data:app.val('rec-data'),
+        diagnostico:app.val('rec-diagnostico').trim(),
+        formaUso:app.val('rec-forma-uso'),
+        formaUsoLivre:app.val('rec-forma-uso-livre').trim(),
+        apresentacao:app._getRecApresentacaoTexto(),
+        apresentacaoQtd:app.val('rec-apresentacao-qtd').trim(),
+        posologia:app.val('rec-posologia').trim(),
+        obs:app.val('rec-obs').trim()
+    };
+    if(receitaEmEdicao.id){ const i=appData.receitas.findIndex(x=>x.id===receitaEmEdicao.id); if(i>=0) appData.receitas[i]=obj; } else appData.receitas.push(obj);
+    receitaEmEdicao=obj;
+    await app.save('receitas'); app.toast('Receita salva!');
+    const btnImp=app.el('btn-imprimir-rec'); if(btnImp) btnImp.style.display='inline-flex';
+};
+
+app.gerarIdRec = () => {
+    const d=new Date(),y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,'0'),day=String(d.getDate()).padStart(2,'0'),pref=`RX${y}.${m}.${day}`;
+    const ex=appData.receitas.filter(r=>r.id&&r.id.startsWith(pref)).map(r=>parseInt(r.id.split('-')[1])||0);
+    return `${pref}-${String(ex.length>0?Math.max(...ex)+1:1).padStart(3,'0')}`;
+};
+
+// ─── IMPRESSÃO ────────────────────────────────────────────────────────────────
+
+app.imprimirReceita = recId => {
+    const rec=recId?appData.receitas.find(r=>r.id===recId):receitaEmEdicao;
+    if(!rec) return app.toast('Receita não encontrada.','err');
+
+    const cfg=appData.config;
+
+    // Cabeçalho esquerdo: SOMENTE o logo
+    const logoH=cfg.logoUrl
+        ?`<img src="${cfg.logoUrl}" style="max-height:85px;max-width:234px;object-fit:contain;display:block;" alt="Logo">`
+        :`<div style="width:120px;height:60px;background:#013425;border-radius:6px;display:flex;align-items:center;justify-content:center;"><span style="color:#C5A365;font-size:11px;font-weight:700;">LOGO</span></div>`;
+
+    // Cabeçalho direito: nome da clínica em destaque, depois os outros dados
+    const hInfoLinhas=[
+        cfg.end1||'',
+        cfg.end2||'',
+        (cfg.tel||cfg.wpp)?`Tel: ${cfg.tel}${cfg.wpp?' · WhatsApp: '+cfg.wpp:''}`: '',
+        cfg.cnpj?`CNPJ: ${cfg.cnpj}`:''
+    ].filter(Boolean).join('<br>');
+
+    const fmtData=new Date(rec.data+'T12:00:00').toLocaleDateString('pt-BR',{day:'2-digit',month:'long',year:'numeric'});
+    const medicoObj=appData.medicos.find(m=>m.id===rec.medicoId);
+    const medicoNome=rec.medico||(medicoObj?medicoObj.nome:'');
+    const medicoCrm=rec.crm||(medicoObj?medicoObj.crm:'');
+    const medicoEsp=rec.especialidade||(medicoObj?medicoObj.especialidade||'':'');
+    const assinatura=medicoObj?.assinatura||'';
+
+    // Forma de uso
+    const formaUsoLabels={oral:'Via Oral',topica:'Uso Tópico',injetavel:'Via Injetável',sublingual:'Via Sublingual',inalatoria:'Via Inalatória',oftalmico:'Uso Oftálmico',nasal:'Uso Nasal',retal:'Uso Retal',vaginal:'Uso Vaginal'};
+    const formaUsoTexto=rec.formaUso==='livre'?(rec.formaUsoLivre||''):(formaUsoLabels[rec.formaUso]||'');
+    const formaUsoHtml=formaUsoTexto?`
+        <div style="margin-bottom:14px;">
+            <span style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;color:#000;">${formaUsoTexto}</span>
+        </div>`:'' ;
+
+    // Apresentação
+    const apresentacaoTexto=rec.apresentacao||'';
+    const apresentacaoQtdTexto=rec.apresentacaoQtd||'';
+    const apresentacaoHtml=apresentacaoTexto?`
+        <div style="margin-top:16px;">
+            <p style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#000;margin-bottom:6px;">Apresentação</p>
+            <div style="font-size:13px;color:#000;">${apresentacaoTexto}${apresentacaoQtdTexto?' — Qtd: '+apresentacaoQtdTexto:''}</div>
+        </div>`:'';
+
+    // Medicamentos: fonte normal (não bold), mesmo tamanho das outras fontes
+    const medsHtml=(rec.medicamentos||[]).map(m=>`
+        <div style="padding:6px 0;border-bottom:1px solid #ddd;">
+            <div style="display:flex;align-items:baseline;gap:10px;">
+                <span style="font-size:13px;font-weight:400;color:#000;">${m.nome}</span>
+                ${m.dosagemQtd?`<span style="font-size:13px;font-weight:400;color:#000;">${app.fmtDosagem(m.dosagemQtd,m.dosagemUnidade)}</span>`:''}
+                ${m.qtdMed?`<span style="font-size:13px;font-weight:400;color:#000;">— Qtd: ${m.qtdMed}</span>`:''}
+            </div>
+            ${m.posologiaMed?`<div style="font-size:12px;color:#000;margin-top:3px;padding-left:4px;">${m.posologiaMed}</div>`:''}
+        </div>`).join('');
+
+    // Posologia geral
+    const posologiaHtml=rec.posologia?`
+        <div style="margin-top:18px;">
+            <p style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#000;margin-bottom:8px;">Posologia</p>
+            <div style="font-size:13px;color:#000;line-height:1.9;white-space:pre-line;">${rec.posologia}</div>
+        </div>`:'';
+
+    // Observação geral
+    const obsHtml=rec.obs?`
+        <div style="margin-top:14px;padding:10px 14px;border:1px solid #aaa;border-radius:4px;">
+            <p style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#000;margin-bottom:4px;">Observações</p>
+            <p style="font-size:13px;color:#000;line-height:1.7;white-space:pre-line;margin:0;">${rec.obs}</p>
+        </div>`:'';
+
+    const html=`
+    <div class="print-page">
+        <div class="print-body">
+            <!-- Cabeçalho: logo à esquerda, dados clínica à direita, alinhados na borda inferior -->
+            <div class="p-header">
+                <div style="display:flex;align-items:flex-end;">${logoH}</div>
+                <div style="text-align:right;display:flex;flex-direction:column;align-items:flex-end;justify-content:flex-end;">
+                    <strong style="font-size:13px;color:#000;display:block;margin-bottom:3px;">TricoMaster Medicina Capilar</strong>
+                    <span class="p-hinfo">${hInfoLinhas}</span>
+                </div>
+            </div>
+            <hr class="p-div">
+
+            <!-- Paciente + Data -->
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:14px 0;">
+                <div>
+                    <p class="p-label">Paciente</p>
+                    <p style="font-size:16px;font-weight:700;color:#000;margin:0;">${rec.paciente}</p>
+                    ${rec.diagnostico?`<p style="font-size:12px;color:#000;margin-top:4px;">${rec.diagnostico}</p>`:''}
+                </div>
+                <div style="text-align:right;">
+                    <p class="p-label">Data</p>
+                    <p style="font-size:13px;font-weight:600;color:#000;margin:0;">${fmtData}</p>
+                </div>
+            </div>
+            <hr class="p-gdiv">
+
+            <!-- Título "Prescrição" centralizado -->
+            <div style="text-align:center;margin:20px 0 22px;">
+                <p style="font-size:18px;font-weight:700;color:#000;letter-spacing:0.1em;text-transform:uppercase;margin:0;">Prescrição</p>
+            </div>
+
+            <!-- Forma de uso + medicamentos -->
+            <div style="margin-bottom:4px;">
+                ${formaUsoHtml}
+                ${medsHtml||'<p style="font-size:13px;color:#000;">Nenhum medicamento.</p>'}
+            </div>
+
+            ${apresentacaoHtml}
+            ${posologiaHtml}
+            ${obsHtml}
+        </div>
+
+        <!-- Assinatura no final — SEM linha divisória acima -->
+        <div class="p-footer" style="text-align:center;">
+            ${assinatura?`<img src="${assinatura}" style="height:160px;max-width:600px;object-fit:contain;display:block;margin:0 auto 8px;" alt="Assinatura">`:'<div style="height:160px;"></div>'}
+            <p style="font-size:14px;font-weight:700;color:#000;margin:0;">${medicoNome}</p>
+            ${medicoEsp?`<p style="font-size:12px;color:#000;margin:3px 0 0;">${medicoEsp}</p>`:''}
+            <p style="font-size:12px;color:#000;margin:4px 0 0;font-weight:600;">${medicoCrm}</p>
+        </div>
+    </div>`;
+
+    app.el('print-content').innerHTML=html;
+    app.show('print-view');
+};
+
+app.fecharImpressao = () => app.hide('print-view');
+
+// ─── CONFIG ───────────────────────────────────────────────────────────────────
+
+app.populateConfig = () => {
+    const c=appData.config;
+    app.setVal('conf-nome',c.nome); app.setVal('conf-logo',c.logoUrl);
+    app.setVal('conf-tel',c.tel);   app.setVal('conf-wpp',c.wpp);
+    app.setVal('conf-end1',c.end1); app.setVal('conf-end2',c.end2);
+    app.setVal('conf-cnpj',c.cnpj||'');
+    app.renderMedicos();
+    app.renderPosologias();
+};
+
+app.saveConfig = async () => {
+    appData.config={nome:app.val('conf-nome'),logoUrl:app.val('conf-logo'),tel:app.val('conf-tel'),wpp:app.val('conf-wpp'),end1:app.val('conf-end1'),end2:app.val('conf-end2'),cnpj:app.val('conf-cnpj')};
+    if(!ui.userDocRef) return;
+    try { await ui.userDocRef.set({config:appData.config},{merge:true}); app.toast('Configurações salvas!'); }
+    catch(e){ app.toast('Erro ao salvar configurações.','err'); }
+};
+
+// ─── MÉDICOS ──────────────────────────────────────────────────────────────────
+
+app.renderMedicos = () => {
+    const lista=app.el('medicos-lista'), empty=app.el('medicos-empty');
+    if(!appData.medicos.length){ lista.innerHTML=''; empty.style.display='block'; return; }
+    empty.style.display='none';
+    lista.innerHTML=[...appData.medicos].sort((a,b)=>a.nome.localeCompare(b.nome)).map(m=>`
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:#f9fafb;border-radius:8px;border:1px solid #eee;">
+            <div>
+                <p style="font-weight:600;font-size:13px;color:#013425;">${m.nome}</p>
+                <p style="font-size:12px;color:#888;">${m.crm||''}${m.especialidade?' · '+m.especialidade:''}</p>
+            </div>
+            <div style="display:flex;gap:4px;">
+                <button onclick="app.editMedico('${m.id}')" class="btn-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>
+                <button onclick="app.deleteMedico('${m.id}')" class="btn-icon btn-danger"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3,6 5,6 21,6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg></button>
+            </div>
+        </div>`).join('');
+};
+
+app.saveMedico = async () => {
+    const id=app.val('medico-edit-id'), nome=app.toTitleCase(app.val('medico-nome').trim()), crm=app.val('medico-crm').trim().toUpperCase();
+    if(!nome) return app.toast('Informe o nome do médico.','err');
+    if(!crm)  return app.toast('Informe o CRM.','err');
+    const obj={id:id||app.uid(),nome,crm,especialidade:app.toTitleCase(app.val('medico-especialidade').trim()),assinatura:app.val('medico-assinatura').trim()};
+    if(id){ const i=appData.medicos.findIndex(m=>m.id===id); if(i>=0) appData.medicos[i]=obj; } else appData.medicos.push(obj);
+    app.resetMedicoForm(); app.renderMedicos(); await app.save('medicos'); app.toast('Médico salvo!');
+};
+
+app.editMedico = id => {
+    const m=appData.medicos.find(x=>x.id===id); if(!m) return;
+    app.setVal('medico-edit-id',m.id); app.setVal('medico-nome',m.nome); app.setVal('medico-crm',m.crm);
+    app.setVal('medico-especialidade',m.especialidade||''); app.setVal('medico-assinatura',m.assinatura||'');
+    app.el('medico-cancel-btn').style.display='inline-flex';
+};
+
+app.deleteMedico = async id => {
+    if(!confirm('Excluir médico?')) return;
+    appData.medicos=appData.medicos.filter(m=>m.id!==id);
+    app.renderMedicos(); await app.save('medicos'); app.toast('Médico excluído.');
+};
+
+app.resetMedicoForm = () => {
+    ['medico-edit-id','medico-nome','medico-crm','medico-especialidade','medico-assinatura'].forEach(id=>app.setVal(id,''));
+    app.el('medico-cancel-btn').style.display='none';
+};
+
+Object.defineProperty(app,'receitaEmEdicao',{get:()=>receitaEmEdicao});
+
+// ─── BOOT ─────────────────────────────────────────────────────────────────────
+window.app=app;
+document.addEventListener('DOMContentLoaded',app.init);
