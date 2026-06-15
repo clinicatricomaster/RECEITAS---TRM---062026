@@ -142,10 +142,10 @@ app.loadPerfil = async uid => {
         if(doc.exists){
             ui.perfil = doc.data().perfil || 'medico';
         } else {
-            // Primeiro acesso: assume admin.
-            // Para outros usuários, defina o perfil manualmente no Console do Firebase:
-            // Coleção "users" → documento com o UID → campo "perfil": "medico"
-            ui.perfil = 'admin';
+            // Primeiro acesso sem documento no Firestore → assume 'medico' por segurança.
+            // Para conceder acesso admin, crie o documento no Console do Firebase:
+            // Coleção "users" → documento com o UID → campo "perfil": "admin"
+            ui.perfil = 'medico';
         }
     } catch(e){
         console.warn('Erro ao carregar perfil, assumindo médico por segurança.');
@@ -382,9 +382,10 @@ app.imprimirControlada = recId => {
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:0;border:1.5px solid #000;margin-bottom:24px;">
         <div style="padding:10px 14px;border-right:1px solid #000;">
             <p style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:#000;margin:0 0 5px 0;font-family:'Inter',sans-serif;">Identificação do Emitente</p>
-            <p style="font-size:12px;font-weight:700;color:#000;margin:0 0 3px 0;font-family:'Inter',sans-serif;">TricoMaster Medicina Capilar</p>
-            <p style="font-size:11px;color:#000;margin:0 0 2px 0;font-family:'Inter',sans-serif;">CNPJ: 49.761.493/0001-71</p>
-            <p style="font-size:11px;color:#000;margin:0 0 2px 0;font-family:'Inter',sans-serif;">Rua Emílio Mallet, 1166</p>
+            <p style="font-size:12px;font-weight:700;color:#000;margin:0 0 3px 0;font-family:'Inter',sans-serif;">${cfg.nome||'TricoMaster Medicina Capilar'}</p>
+            ${cfg.cnpj?`<p style="font-size:11px;color:#000;margin:0 0 2px 0;font-family:'Inter',sans-serif;">CNPJ: ${cfg.cnpj}</p>`:''}
+            ${cfg.end1?`<p style="font-size:11px;color:#000;margin:0 0 2px 0;font-family:'Inter',sans-serif;">${cfg.end1}</p>`:''}
+            ${cfg.end2?`<p style="font-size:11px;color:#000;margin:0 0 2px 0;font-family:'Inter',sans-serif;">${cfg.end2}</p>`:''}
             ${cfg.tel?`<p style="font-size:11px;color:#000;margin:0;font-family:'Inter',sans-serif;">Tel: ${cfg.tel}${cfg.wpp?' · '+cfg.wpp:''}</p>`:''}
         </div>
         <div style="padding:10px 14px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;">
@@ -543,6 +544,118 @@ app.resetMedForm = () => {
     app.el('med-cancel-btn').style.display='none';
 };
 
+// ─── IMPORTAÇÃO EXCEL ─────────────────────────────────────────────────────────
+
+app.importarExcelMedicamentos = async (input) => {
+    const file = input.files[0]; if(!file) return;
+    try {
+        const data = await file.arrayBuffer();
+        const wb = XLSX.read(data, {type:'array'});
+        const ws = wb.Sheets['Medicamentos'];
+        if(!ws){ app.toast('Aba "Medicamentos" não encontrada.','err'); return; }
+        const rows = XLSX.utils.sheet_to_json(ws, {header:['nome','dosagemQtd','dosagemUnidade'], range:9, defval:''});
+        let adicionados=0, ignorados=0;
+        for(const row of rows){
+            const nome = (row.nome||'').toString().trim();
+            if(!nome || nome.startsWith('▼')) continue;
+            // Skip example rows (col F = "✅ Exemplo")
+            const toTCase = s => s ? s.replace(/\b\w/g,c=>c.toUpperCase()) : s;
+            const obj = {
+                id: app.uid(),
+                nome: toTCase(nome),
+                dosagemQtd: (row.dosagemQtd||'').toString().trim(),
+                dosagemUnidade: (row.dosagemUnidade||'').toString().trim()
+            };
+            // Evitar duplicatas pelo nome
+            const existe = appData.medicamentos.find(m=>m.nome.toLowerCase()===obj.nome.toLowerCase());
+            if(existe){ ignorados++; continue; }
+            appData.medicamentos.push(obj);
+            adicionados++;
+        }
+        if(adicionados>0){
+            await app.save('medicamentos');
+            app.renderMedicamentos();
+            app.toast(`${adicionados} medicamento(s) importado(s)${ignorados>0?' · '+ignorados+' duplicata(s) ignorada(s)':''}.`,'ok');
+        } else {
+            app.toast(ignorados>0?`Nenhum novo — ${ignorados} já existente(s).`:'Nenhum medicamento encontrado no arquivo.','err');
+        }
+    } catch(e){
+        console.error(e);
+        app.toast('Erro ao ler o arquivo Excel.','err');
+    }
+    input.value='';
+};
+
+// ─── IMPORTAÇÃO EXCEL — FÓRMULAS ──────────────────────────────────────────────
+/*
+ * Formato esperado da aba "Formulas":
+ * Linha 1: cabeçalho (ignorada)
+ * Colunas: A=Nome da Fórmula | B=Descrição | C=Apresentação | D=Posologia | E=Observação
+ *          F=Med1 Nome | G=Med1 DosagemQtd | H=Med1 DosagemUnidade |
+ *          I=Med2 Nome | J=Med2 DosagemQtd | K=Med2 DosagemUnidade |
+ *          ... (grupos de 3 colunas por medicamento, até 10 meds)
+ */
+app.importarExcelFormulas = async (input) => {
+    const file = input.files[0]; if(!file) return;
+    try {
+        const data = await file.arrayBuffer();
+        const wb = XLSX.read(data, {type:'array'});
+        const ws = wb.Sheets['Formulas'];
+        if(!ws){ app.toast('Aba "Formulas" não encontrada.','err'); input.value=''; return; }
+
+        const rows = XLSX.utils.sheet_to_json(ws, {defval:''});
+        const tc = s => s ? s.replace(/\b\w/g,c=>c.toUpperCase()) : '';
+        let adicionados=0, ignorados=0;
+
+        for(const row of rows){
+            const nome = tc((row['Nome'] || row['nome'] || row['NOME'] || Object.values(row)[0] || '').toString().trim());
+            if(!nome) continue;
+
+            // Deduplicar por nome
+            const existe = appData.formulas.find(f=>f.nome.toLowerCase()===nome.toLowerCase());
+            if(existe){ ignorados++; continue; }
+
+            // Medicamentos: colunas Med1_Nome, Med1_Dosagem, Med1_Unidade, Med2_Nome, ...
+            // Suporta tanto cabeçalho "Med1 Nome" quanto "Med1_Nome" quanto índices numéricos
+            const medicamentos = [];
+            for(let i=1; i<=10; i++){
+                const nomeMed = tc((
+                    row[`Med${i} Nome`] || row[`Med${i}_Nome`] || row[`Med${i}Nome`] ||
+                    row[`Medicamento${i}`] || ''
+                ).toString().trim());
+                if(!nomeMed) break;
+                const dosagemQtd  = (row[`Med${i} Dosagem`] || row[`Med${i}_Dosagem`] || row[`Med${i}Dosagem`] || row[`Med${i} DosagemQtd`] || '').toString().trim();
+                const dosagemUnidade = (row[`Med${i} Unidade`] || row[`Med${i}_Unidade`] || row[`Med${i}Unidade`] || row[`Med${i} DosagemUnidade`] || 'mg').toString().trim();
+                medicamentos.push({id:app.uid(), nome:nomeMed, dosagemQtd, dosagemUnidade});
+            }
+
+            const obj = {
+                id: app.uid(),
+                nome,
+                desc:         (row['Descricao'] || row['Descrição'] || row['desc'] || '').toString().trim(),
+                apresentacao: tc((row['Apresentacao'] || row['Apresentação'] || '').toString().trim()),
+                posologia:    (row['Posologia'] || row['posologia'] || '').toString().trim(),
+                obs:          (row['Observacao'] || row['Observação'] || row['obs'] || '').toString().trim(),
+                medicamentos,
+            };
+            appData.formulas.push(obj);
+            adicionados++;
+        }
+
+        if(adicionados>0){
+            await app.save('formulas');
+            app.renderFormulaList();
+            app.toast(`${adicionados} fórmula(s) importada(s)${ignorados>0?' · '+ignorados+' duplicata(s) ignorada(s)':''}.`,'ok');
+        } else {
+            app.toast(ignorados>0?`Nenhuma nova — ${ignorados} já existente(s).`:'Nenhuma fórmula encontrada no arquivo.','err');
+        }
+    } catch(e){
+        console.error(e);
+        app.toast('Erro ao ler o arquivo Excel.','err');
+    }
+    input.value='';
+};
+
 // ─── POSOLOGIAS PADRÃO ────────────────────────────────────────────────────────
 
 app.renderPosologias = () => {
@@ -628,7 +741,11 @@ app.onModalMedSelect = () => {
 
 app.fecharModalAddMed = () => {
     app.hide('modal-add-med');
-    // Garantir que o botão sempre volta ao estado "Adicionar"
+    // Restaurar todos os campos e botão ao estado "Adicionar"
+    app.setVal('modal-med-select',''); app.setVal('modal-med-nome','');
+    app.setVal('modal-med-dosagem-qtd',''); app.setVal('modal-med-dosagem-unidade','mg');
+    app.setVal('modal-med-posologia',''); app.setVal('modal-med-qtd','');
+    app.setVal('modal-posologia-select','');
     const btnConfirmar = document.querySelector('#modal-add-med .btn-primary');
     if(btnConfirmar){
         btnConfirmar.textContent = 'Adicionar';
@@ -833,10 +950,10 @@ app.editFormula = id => {
 
 app.voltarFormulaList = () => app.renderFormulaList();
 
-app.copyFormula = id => {
+app.copyFormula = async id => {
     const f=appData.formulas.find(x=>x.id===id); if(!f) return;
     const copia=JSON.parse(JSON.stringify(f)); copia.id=app.uid(); copia.nome=copia.nome+' (cópia)';
-    appData.formulas.push(copia); app.save('formulas'); app.renderFormulaList(); app.toast('Fórmula duplicada!');
+    appData.formulas.push(copia); await app.save('formulas'); app.renderFormulaList(); app.toast('Fórmula duplicada!');
 };
 
 app.deleteFormula = async id => {
@@ -1155,12 +1272,14 @@ app.imprimirReceita = recId => {
             ${obsHtml}
         </div>
 
-        <!-- Assinatura no final — SEM linha divisória acima -->
+        <!-- Assinatura no final -->
         <div class="p-footer" style="text-align:center;">
-            ${assinatura?`<img src="${assinatura}" style="height:160px;max-width:600px;object-fit:contain;display:block;margin:0 auto 8px;" alt="Assinatura">`:'<div style="height:160px;"></div>'}
-            <p style="font-size:14px;font-weight:700;color:#000;margin:0;">${medicoNome}</p>
-            ${medicoEsp?`<p style="font-size:12px;color:#000;margin:3px 0 0;">${medicoEsp}</p>`:''}
-            <p style="font-size:12px;color:#000;margin:4px 0 0;font-weight:600;">${medicoCrm}</p>
+            ${assinatura?`<img src="${assinatura}" style="height:88px;max-width:280px;object-fit:contain;display:block;margin:0 auto 6px;" alt="Assinatura">`:'<div style="height:88px;"></div>'}
+            <div style="border-top:1px solid #000;padding-top:6px;display:inline-block;min-width:220px;">
+                <p style="font-size:13px;font-weight:700;color:#000;margin:0;">${medicoNome}</p>
+                ${medicoEsp?`<p style="font-size:11px;color:#000;margin:3px 0 0;">${medicoEsp}</p>`:''}
+                <p style="font-size:12px;color:#000;margin:4px 0 0;font-weight:600;">${medicoCrm}</p>
+            </div>
         </div>
     </div>`;
 
